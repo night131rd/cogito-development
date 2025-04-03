@@ -1,0 +1,7 @@
+requests
+PyMuPDF (fitz)
+sentence-transformers
+numpy
+scikit-learn
+openai
+python-dotenv
