@@ -10,6 +10,8 @@ import threading
 from sentence_transformers import SentenceTransformer
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
+import os 
+
 # INISIASI LLM
 system_prompt = """"Anda adalah asisten pencarian akademik ahli yang menggunakan alur pemikiran terstruktur (chain of thought). Ikuti langkah-langkah berikut untuk input pengguna:
 
@@ -57,12 +59,13 @@ Hanya itu yang perlu Anda kirimkan. Terima kasih!
 """
 
 # API LLM
+load_dotenv()
 messages = [
         {"role": "system", "content": system_prompt},
 ]  # Store conversation history
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
-    api_key="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"
+    api_key="OPEN_ROUTER_API"
 )
 # Input pengguna
 while True:
