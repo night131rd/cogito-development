@@ -7,6 +7,9 @@ from openai import OpenAI
 import json
 import time
 import threading
+from sentence_transformers import SentenceTransformer
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 # INISIASI LLM
 system_prompt = """"Anda adalah asisten pencarian akademik ahli yang menggunakan alur pemikiran terstruktur (chain of thought). Ikuti langkah-langkah berikut untuk input pengguna:
 
@@ -59,9 +62,8 @@ messages = [
 ]  # Store conversation history
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
-    api_key="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",
+    api_key="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"
 )
-
 # Input pengguna
 try:
         pencarian = input("Cognito Disini: ") 
@@ -75,7 +77,7 @@ except ValueError as e:
 messages.append({"role": "user", "content": pencarian})
 try:
         completion = client.chat.completions.create(
-                model="google/gemini-2.0-flash-exp:free",
+                model="google/gemini-2.0-flash-thinking-exp:free",
                 messages=messages,
                 temperature= 2,
         )
@@ -100,6 +102,157 @@ except (json.JSONDecodeError, KeyError) as e:
 # Counter untuk PDF yang diunduh
 list_pdf = [] # Meyimpan teks hasil ekstraksi PDF dalam list
 index = 0 # Menghitung jumlah PDF yang diunduh
+# Berikan jawaban pengguna berdasarkan list_pdf menggunakan OpenAI LLM
+class RAGSystem:
+    def __init__(self):
+        # Inisialisasi model embedding
+        self.model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+        self.document_chunks = []
+        self.document_embeddings = []
+        self.metadata = []
+
+    def add_document(self, document: str, doc_index: int, title: str, year: str):
+        """Memproses dan menambahkan dokumen langsung saat diunduh"""
+        print(f"Menambahkan dokumen ke RAG system: {title} ({year})")
+        
+        # Membagi dokumen menjadi chunk
+        chunks = self.chunk_document(document, chunk_size=500, overlap=100)
+        
+        new_chunks = []
+        new_metadata = []
+        
+        for chunk_index, chunk in enumerate(chunks):
+            if len(chunk.strip()) < 50:  # Abaikan chunk yang terlalu pendek
+                continue
+                
+            # Simpan chunk dan metadata
+            new_chunks.append(chunk)
+            new_metadata.append({
+                "doc_index": doc_index,
+                "chunk_index": chunk_index,
+                "title": title,
+                "year": year
+            })
+        
+        # Buat embedding untuk chunk baru
+        if new_chunks:
+            new_embeddings = self.model.encode(new_chunks)
+            
+            # Tambahkan ke database
+            self.document_chunks.extend(new_chunks)
+            self.document_embeddings = np.vstack([self.document_embeddings, new_embeddings]) if len(self.document_embeddings) > 0 else new_embeddings
+            self.metadata.extend(new_metadata)
+            
+            print(f"Berhasil menambahkan {len(new_chunks)} chunk dari dokumen {doc_index+1}")
+        else:
+            print("Tidak ada chunk yang valid untuk ditambahkan")
+        
+    def process_documents(self, documents: List[str]):
+        """Memproses dokumen dan mempersiapkan untuk retrieval"""
+        print("Memproses dokumen untuk RAG...")
+        # Bersihkan list sebelumnya
+        self.document_chunks = []
+        self.document_embeddings = []
+        self.metadata = []
+        
+        for doc_index, document in enumerate(documents):
+            # Membagi dokumen menjadi chunk
+            chunks = self.chunk_document(document, chunk_size=500, overlap=100)
+            
+            for chunk_index, chunk in enumerate(chunks):
+                if len(chunk.strip()) < 50:  # Abaikan chunk yang terlalu pendek
+                    continue
+                    
+                # Simpan chunk dan metadata
+                self.document_chunks.append(chunk)
+                self.metadata.append({
+                    "doc_index": doc_index,
+                    "chunk_index": chunk_index
+                })
+        
+        # Buat embedding untuk semua chunk
+        if self.document_chunks:
+            self.document_embeddings = self.model.encode(self.document_chunks)
+            print(f"RAG system telah memproses {len(self.document_chunks)} chunk dari {len(documents)} dokumen")
+        else:
+            print("Tidak ada chunk yang valid untuk diproses")
+    
+    def chunk_document(self, document: str, chunk_size: int = 500, overlap: int = 100) -> List[str]:
+        """Membagi dokumen menjadi chunk dengan overlap"""
+        # Split dokumen berdasarkan paragraf atau halaman
+        parts = re.split(r'===== PAGE \d+ =====|\n\n', document)
+        chunks = []
+        
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+                
+            # Jika bagian lebih pendek dari chunk_size, simpan sebagai chunk
+            if len(part) <= chunk_size:
+                chunks.append(part)
+            else:
+                # Bagi menjadi chunk yang lebih kecil dengan overlap
+                words = part.split()
+                words_per_chunk = chunk_size // 5  # Perkiraan 5 karakter per kata
+                
+                for i in range(0, len(words), words_per_chunk - overlap // 5):
+                    chunk = ' '.join(words[i:i + words_per_chunk])
+                    if chunk:
+                        chunks.append(chunk)
+        
+        return chunks
+    
+    def retrieve(self, query: str, top_k: int = 5) -> List[Dict]:
+        """Mengambil dokumen yang paling relevan dengan query tanpa filter tahun"""
+        if (isinstance(self.document_embeddings, np.ndarray) and self.document_embeddings.size == 0) or len(self.document_chunks) == 0:
+            return []
+        
+        # Encoding query
+        query_embedding = self.model.encode([query])[0]
+        
+        # Hitung similarity
+        similarities = cosine_similarity([query_embedding], self.document_embeddings)[0]
+        
+        # Dapatkan top-k chunks berdasarkan similarity
+        top_indices = np.argsort(similarities)[::-1][:top_k]
+        
+        results = []
+        for idx in top_indices:
+            results.append({
+                "text": self.document_chunks[idx],
+                "metadata": self.metadata[idx],
+                "similarity": similarities[idx]
+            })
+        
+        return results
+
+    def generate_context(self, query: str, max_year: str, top_k: int = 5) -> str:
+        """Membuat konteks berdasarkan hasil retrieval tanpa filter tahun"""
+        retrieved_docs = self.retrieve(query, top_k)
+        
+        if not retrieved_docs:
+            return "Tidak ada informasi yang relevan ditemukan."
+        
+        # Berikan informasi tahun yang jelas dalam konteks, tetapi tidak memfilter hasil
+        context = f"KONTEKS UNTUK PERTANYAAN (INGAT: GUNAKAN SITASI DENGAN TAHUN <= {max_year.strip('-')} SAJA):\n\n"
+        for i, doc in enumerate(retrieved_docs, 1):
+            year = doc['metadata'].get('year', 'N/A')
+            # Format yang menekankan tahun dokumen
+            context += f"[Dokumen {i}] - TAHUN PUBLIKASI: {year}\n"
+            if year != 'N/A':
+                try:
+                    year_int = int(year)
+                    max_year_int = int(max_year.strip('-'))
+                    if year_int <= max_year_int:
+                        context += f"TAHUN VALID ✓ ({year} <= {max_year.strip('-')})\n"
+                    else:
+                        context += f"TAHUN TIDAK VALID ✗ ({year} > {max_year.strip('-')}) - JANGAN GUNAKAN UNTUK SITASI!\n"
+                except ValueError:
+                    pass
+            context += f"{doc['text']}\n\n"
+        
+        return context
 
 # Fungsi pencari jurnal
 class JurnalSearch:
@@ -109,6 +262,7 @@ class JurnalSearch:
                 self.headers = {
                         "Accept": "application/json"
                 }
+                self.rag = RAGSystem()
                 try:
                         response = requests.get(self.url_semantic)
                         response1 = requests.get(self.url_openalex)
@@ -164,7 +318,6 @@ class JurnalSearch:
                         print(f"Error: {e}")
                         return []
                 
-        # Fungsi untuk mengunduh PDF dari URL dan mengekstrak teks
         def process_semantic_from_url(self, url: str) -> str:
                 """Process PDF from URL and extract text"""
                 try:
@@ -172,9 +325,12 @@ class JurnalSearch:
                         if response.status_code == 200:
                                 global index
                                 index +=1
-                                print(f"\nTitle: {paper['title']}")
-                                print(f"Year: {paper.get('year', 'N/A')}")
-                                print(f"Authors: {', '.join(author['name'] for author in paper['authors'])}")
+                                title = paper['title']
+                                year = paper.get('year', 'N/A')
+                                authors = ', '.join(author['name'] for author in paper['authors'])
+                                print(f"\nTitle: {title}")
+                                print(f"Year: {year}")
+                                print(f"Authors: {authors}")
                                 print(f"Abstract: {paper.get('abstract', 'N/A')}")
                                 print(f"Downloading PDF {index}...") # Counter untuk PDF yang diunduh
                                 pdf_content = response.content  #Konten PDF dalam bentuk byte
@@ -192,14 +348,20 @@ class JurnalSearch:
                         # Download PDF
                         pdf_path = f"paper{index}.pdf"
                         with open(pdf_path, "wb") as f:
-                                f.write(pdf_stream.read())
+                                f.write(pdf_content)
 
                         # Ekstrak teks
                         text = ""
                         for page in doc:
                                 text += page.get_text()
-                                
-                        return self.clean_text(text)
+                        
+                        # Bersihkan teks
+                        cleaned_text = self.clean_text(text)
+                        
+                        # Tambahkan langsung ke RAG system
+                        self.rag.add_document(cleaned_text, index-1, title, str(year))
+                        
+                        return cleaned_text
                 except Exception as e:
                         print(f"Error processing PDF: {e}")
                         return ""
@@ -209,12 +371,14 @@ class JurnalSearch:
                 try:
                         response = requests.get(url, timeout=5)
                         if response.status_code == 200:
-                                        global index
-                                        index +=1
-                                        print(f"\nTitle: {paper['title']}")
-                                        print(f"Year: {paper.get('publication_year', 'N/A')}")
-                                        print(f"Downloading PDF {index}...") # Counter untuk PDF yang diunduh
-                                        pdf_content = response.content  #Konten PDF dalam bentuk byte
+                                global index
+                                index +=1
+                                title = paper['title']
+                                year = paper.get('publication_year', 'N/A')
+                                print(f"\nTitle: {title}")
+                                print(f"Year: {year}")
+                                print(f"Downloading PDF {index}...") # Counter untuk PDF yang diunduh
+                                pdf_content = response.content  #Konten PDF dalam bentuk byte
                         else:
                                 raise Exception(f"Gagal mengakses URL. Status code: {response.status_code}")
                 except requests.exceptions.RequestException as e:
@@ -229,15 +393,20 @@ class JurnalSearch:
                         # Download PDF
                         pdf_path = f"paper{index}.pdf"
                         with open(pdf_path, "wb") as f:
-                                f.write(pdf_stream.read())
+                                f.write(pdf_content)
                        
-
                         # Ekstrak teks
                         text = ""
                         for page in doc:
                                 text += page.get_text()
-                                
-                        return self.clean_text(text)
+                        
+                        # Bersihkan teks
+                        cleaned_text = self.clean_text(text)
+                        
+                        # Tambahkan langsung ke RAG system
+                        self.rag.add_document(cleaned_text, index-1, title, str(year))
+                        
+                        return cleaned_text
                 except Exception as e:
                         print(f"Error processing PDF: {e}")
                         return ""
@@ -282,8 +451,9 @@ if input_semantic:
                 print(f"Total papers found: {len(papers)}")
         selesai = False
         for paper in papers:
-                if index >= 4 or any(paper == p for p in papers[-1]):
+                if index >= 8 or any(paper == p for p in papers[-1]):
                         selesai = True
+                        print("Memulai mendapatkan jawaban...")
                         break  # Stop processing more papers once we have 4 PDFs or reached the last paper                        # Check if the paper is in the list of papers
                         
                 # Proper PDF URL handling
@@ -312,40 +482,57 @@ if input_semantic:
                 elif not paper.get('openAccessPdf') and not paper.get('primary_location',{}).get('pdf_url'):
                         print("No open access PDF available")
 
-# Berikan jawaban pengguna berdasarkan list_pdf menggunakan OpenAI LLM
-if selesai == True:
-        # Prompt jawaban
-        # Path file pdf
-        prompt_answer = f"""
-Anda adalah asisten penulisan akademik yang pandai melakukan sitasi pada artikel ilmiah 
-Contoh cara melakukan sitasi:
-Misalnya: maksimal tahun 2023
-Text yang diambil dari paper: "Benih bermutu tinggi memiliki ukuran yang seragam, memastikan keseragaman pertumbuhan (Kartika, 20023)"
-Cara tersebut benar karena 2023 lebih muda dari maksimal tahun yaitu 2023.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  
 
-Text yang diambil dari paper: "Pisaunya tajam dan mudah digunakan (Kartika et al., 2022)"
-Mengambil paragraft tersebut tidak benar karena tahun 2022 lebih tua dari maksimal tahun yaitu 2023.
 
-Pastikan output  menjadi paragraf dengan format kutipan sebagai berikut:
+# ... existing code ...
 
-Jika hanya 1 penulis:
-(Nama, Tahun)
+if selesai is True:
+    # Gunakan RAG yang telah diisi selama unduhan
+    if hasattr(scholar, 'rag') and scholar.rag.document_chunks:
+        rag_system = scholar.rag
+    else:
+        # Jika RAG belum diisi, gunakan list_pdf
+        rag_system = RAGSystem()
+        rag_system.process_documents(list_pdf)
+    
+    # Generate konteks untuk query
+    context = rag_system.generate_context(pencarian, tahun)
+    
+    # Perbarui prompt untuk lebih menekankan batasan tahun
+    system_prompt_answer = f"""
+INSTRUKSI WAJIB - ATURAN SITASI AKADEMIK
 
-Jika 2 penulis:
-(Nama1 & Nama2, Tahun)
+Anda adalah seorang dosen peneliti yang sedang menulis paper akademik dengan standar tinggi.
 
-Jika lebih darti 2 penulis:
-(Nama1 et al., Tahu)
-Aturan:
--Penulis hanya ditulis nama akhir  
-contoh : Muhaammad Askur Kholis 
-Nama : Kholis
--Tahun mengacu pada tahun publikasi jurnal, Pastikan jurnal yang diambil tahunnya tidak lebih dari maksimal tahun {tahun}, apabila tahun jurnal yang di sitasi melebihi {tahun}, cari referensi lain 
--Halaman mengacu pada statement yang diambil dari paper berada di halaman berapa
-- Output berisi 1 paragraf yang berisi 6 - 8 kalimat dengan maksimal 4 kutipan
-Format kutipan ditempatkan tepatt setelah pernyataan dalam tanda kurung
+ATURAN SITASI YANG HARUS DIPATUHI:
+1. Hanya gunakan sitasi dengan tahun >= {tahun.strip('-')} (Sama dengan ATAU lebih baru dari {tahun.strip('-')})
+2. Rentang tahun yang DIPERBOLEHKAN: {tahun.strip('-')} sampai 2025
 
-Contoh Output:
+============= VALIDASI SITASI =============
+Untuk SETIAP sitasi yang Anda gunakan:
+1. Ekstrak tahun dari sitasi (misalnya: dari "(Ahmad, 2020)" ekstrak "2020")
+2. Bandingkan: tahun_sitasi >= {tahun.strip('-')}?
+3. Jika YA: sitasi VALID dan BOLEH digunakan
+4. Jika TIDAK: sitasi TIDAK VALID dan DILARANG digunakan!
+=======================================
+
+CONTOH untuk max_tahun {tahun.strip('-')}:
+- Sitasi (Ahmad, {int(tahun.strip('-'))-1}) → TIDAK VALID! {int(tahun.strip('-'))-1} < {tahun.strip('-')}
+- Sitasi (Budi, {tahun.strip('-')}) → VALID! {tahun.strip('-')} = {tahun.strip('-')}
+- Sitasi (Citra, {int(tahun.strip('-'))+1}) → VALID! {int(tahun.strip('-'))+1} > {tahun.strip('-')}
+- Sitasi (Dewi, {int(tahun.strip('-'))+3}) → VALID! {int(tahun.strip('-'))+3} > {tahun.strip('-')}
+
+GAYA PENULISAN:
+- Tulis seperti dosen peneliti yang sedang menulis paper ilmiah
+- Gunakan bahasa akademik yang formal dan presisi
+- Sajikan informasi dengan logis dan terstruktur
+
+FORMAT OUTPUT:
+1. Satu paragraf akademik (5-8 kalimat)
+2. Minimal 2 sitasi dengan format (Nama, Tahun) 
+3. Semua tahun sitasi HARUS >= {tahun.strip('-')}
+
+CONTOH OUTPUT:
 Rokok adalah produk olahan tembakau yang dikemas dalam bentuk silinder dari kertas dengan campuran cengkeh dan bahan tambahan lainnya yang diproduksi
 oleh pabrik maupun dibuat sendiri, yang digunakan dengan cara dibakar pada salah satu ujungnya dan dibiarkan membara agar asapnya dapat dihirup melalui
 mulut pada ujung lainnya. Kandungan berbahaya dalam rokok meliputi lebih dari 7.000 bahan kimia, termasuk nikotin yang bersifat adiktif, tar yang dapat
@@ -355,31 +542,86 @@ dicegah di seluruh dunia, dengan estimasi lebih dari 8 juta kematian setiap tahu
 merokok secara signifikan meningkatkan risiko berbagai penyakit serius seperti kanker paru-paru, penyakit jantung koroner, stroke, dan penyakit
 paru obstruktif kronik (PPOK)..
 
-Instruksi:
-Tuliskan jaaawaban penjelasan mendetail tentang  {pencarian}, berdasarkan pengetahuan anda dan dokumen {list_pdf}  seperti contoh di atas, apabila iformasi yang diambil dari paper, pastikan untuk melakukan sitasi. Jawaban harus berisi 6-8 kalimat dan minimal maksimal 2 sitasi.
-Pastikan jawaban yang anda berikan relevan dengan menggunakan alur pemikiran terstruktur (chain of thought) dan  sitasi pada jurnal dengan tahun rilis lebih muda atau pada tahun {tahun}.
+
+KONTEKS YANG RELEVAN:
+{context}
+
+PERTANYAAN: {pencarian}
 """
-        
-        # Mulai percakapan dengan OpenAI LLM
-        messages.append({"role": "user", "content": prompt_answer})
-        try:
-                # Get LLM completion
-                completion = client.chat.completions.create(
-                        model="google/gemini-2.0-flash-exp:free",
-                        temperature= 0.8,
-                        messages= [{"role": "user", "content": prompt_answer}]
-                )
-                # Print jawaban dari OpenAI LLM
-                print("Jawaban Berdasarkan Jurnal:", completion.choices[0].message.content)
-        except Exception as e:
-                print(f"Error with llM: {e}")
-        
-        try:
-                with open("textpdf.txt", "w", encoding='utf-8') as f:
-                        for idx, pdf_text in enumerate(list_pdf, 1):
-                                f.write(pdf_text)
-                                f.write("\n\n")
-        except Exception as e:
-                print(f"Error writing to file: {e}")
 
+    # Gunakan variabel messages baru untuk jawaban
+    answer_messages = [
+        {"role": "system", "content": system_prompt_answer},
+        {"role": "user", "content": pencarian}
+    ]
+    
+    # Perbaiki fungsi validasi sitasi untuk memeriksa tahun >= max_tahun
+    def validate_citations(response_text, max_year):
+        """Memvalidasi tahun pada sitasi dalam output LLM"""
+        max_year_int = int(max_year.strip('-'))
+        # Regex untuk mencocokkan pola sitasi (Nama, Tahun)
+        citation_pattern = r'\([A-Za-z\s&]+,\s*(\d{4})\)'
+        
+        citations = re.findall(citation_pattern, response_text)
+        invalid_citations = []
+        
+        for year_str in citations:
+            try:
+                year = int(year_str)
+                # Tahun harus >= max_year_int
+                if year < max_year_int:
+                    invalid_citations.append(f"({year_str}) < {max_year_int}")
+            except ValueError:
+                continue
+        
+        if invalid_citations:
+            return False, f"Ditemukan sitasi dengan tahun yang tidak valid: {', '.join(invalid_citations)}"
+        return True, "Semua sitasi valid"
 
+    # Implementasi two-step approach dengan validasi
+    try:
+        # Langkah 1: Generate respons awal
+        completion = client.chat.completions.create(
+                model="google/gemini-2.0-flash-thinking-exp:free",
+                temperature=0.2,  # Sedikit randomness untuk kreativitas
+                messages=answer_messages
+        )
+        response_text = completion.choices[0].message.content
+        
+        # Langkah 2: Validasi sitasi
+        is_valid, validation_message = validate_citations(response_text, tahun)
+        
+        if is_valid:
+            print("Jawaban Berdasarkan Jurnal:", response_text)
+        else:
+            # Jika tidak valid, minta LLM memperbaiki dengan pesan yang lebih tegas
+            correction_prompt = f"""
+KOREKSI WAJIB - KESALAHAN DALAM SITASI!
+
+{validation_message}
+
+ATURAN:
+- Tahun sitasi HARUS >= {tahun.strip('-')}
+- Gunakan HANYA sitasi dengan tahun {tahun.strip('-')} sampai 2025
+- DILARANG menggunakan sitasi dengan tahun < {tahun.strip('-')}
+
+Tulis ulang paragraf Anda dengan memperbaiki sitasi yang tidak valid.
+Jawaban tetap harus berisi 5-8 kalimat dengan minimal 2 sitasi yang valid.
+"""
+            correction_messages = [
+                {"role": "system", "content": system_prompt_answer},
+                {"role": "user", "content": pencarian},
+                {"role": "assistant", "content": response_text},
+                {"role": "user", "content": correction_prompt}
+            ]
+            
+            # Minta koreksi
+            correction = client.chat.completions.create(
+                    model="google/gemini-2.0-flash-thinking-exp:free",
+                    temperature=0,
+                    messages=correction_messages
+            )
+            
+            print("Jawaban yang Dikoreksi:", correction.choices[0].message.content)
+    except Exception as e:
+        print(f"Error with LLM: {e}")
